@@ -9,8 +9,9 @@ from collections import Counter
 import logging
 
 try:
-    from imblearn.over_sampling import SMOTE, RandomOverSampler
+    from imblearn.over_sampling import SMOTE, RandomOverSampler, BorderlineSMOTE, ADASYN
     from imblearn.under_sampling import RandomUnderSampler
+    from imblearn.combine import SMOTEENN
     from sklearn.utils.class_weight import compute_class_weight
     IMBALANCED_LEARN_AVAILABLE = True
 except ImportError:
@@ -33,7 +34,8 @@ class DataBalancer:
         self.method = balancing_config.get('balancing_method', 'smote')
         self.enabled = balancing_config.get('enable_balancing', True)
         
-        if not IMBALANCED_LEARN_AVAILABLE and self.method in ['smote', 'oversample', 'undersample']:
+        advanced_methods = ['smote', 'borderline_smote', 'adasyn', 'smoteenn', 'oversample', 'undersample']
+        if not IMBALANCED_LEARN_AVAILABLE and self.method in advanced_methods:
             logger.warning(
                 "imbalanced-learn not available. Install with: pip install imbalanced-learn"
             )
@@ -59,6 +61,12 @@ class DataBalancer:
         
         if self.method == 'smote':
             return self._apply_smote(X, y)
+        elif self.method == 'borderline_smote':
+            return self._apply_borderline_smote(X, y)
+        elif self.method == 'adasyn':
+            return self._apply_adasyn(X, y)
+        elif self.method == 'smoteenn':
+            return self._apply_smoteenn(X, y)
         elif self.method == 'oversample':
             return self._apply_oversample(X, y)
         elif self.method == 'undersample':
@@ -117,6 +125,60 @@ class DataBalancer:
             return X_balanced, y_balanced
         except Exception as e:
             logger.error(f"Random undersampling failed: {e}. Using original data.")
+            return X, y
+    
+    def _apply_borderline_smote(self, X: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Apply BorderlineSMOTE oversampling."""
+        if not IMBALANCED_LEARN_AVAILABLE:
+            return X, y
+        
+        try:
+            borderline_smote = BorderlineSMOTE(
+                k_neighbors=self.config.get('smote_k_neighbors', 5),
+                random_state=self.config.get('smote_random_state', 42)
+            )
+            X_balanced, y_balanced = borderline_smote.fit_resample(X, y)
+            logger.info(f"BorderlineSMOTE balanced class distribution: {Counter(y_balanced)}")
+            return X_balanced, y_balanced
+        except Exception as e:
+            logger.error(f"BorderlineSMOTE failed: {e}. Using original data.")
+            return X, y
+    
+    def _apply_adasyn(self, X: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Apply ADASYN oversampling."""
+        if not IMBALANCED_LEARN_AVAILABLE:
+            return X, y
+        
+        try:
+            adasyn = ADASYN(
+                n_neighbors=self.config.get('smote_k_neighbors', 5),
+                random_state=self.config.get('smote_random_state', 42)
+            )
+            X_balanced, y_balanced = adasyn.fit_resample(X, y)
+            logger.info(f"ADASYN balanced class distribution: {Counter(y_balanced)}")
+            return X_balanced, y_balanced
+        except Exception as e:
+            logger.error(f"ADASYN failed: {e}. Using original data.")
+            return X, y
+    
+    def _apply_smoteenn(self, X: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Apply SMOTEENN (SMOTE + Edited Nearest Neighbours) hybrid method."""
+        if not IMBALANCED_LEARN_AVAILABLE:
+            return X, y
+        
+        try:
+            smoteenn = SMOTEENN(
+                smote=SMOTE(
+                    k_neighbors=self.config.get('smote_k_neighbors', 5),
+                    random_state=self.config.get('smote_random_state', 42)
+                ),
+                random_state=self.config.get('smote_random_state', 42)
+            )
+            X_balanced, y_balanced = smoteenn.fit_resample(X, y)
+            logger.info(f"SMOTEENN balanced class distribution: {Counter(y_balanced)}")
+            return X_balanced, y_balanced
+        except Exception as e:
+            logger.error(f"SMOTEENN failed: {e}. Using original data.")
             return X, y
     
     def compute_class_weights(self, y: np.ndarray) -> Dict[str, float]:

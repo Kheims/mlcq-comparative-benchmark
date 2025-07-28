@@ -5,12 +5,14 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, TensorDataset
+from torch.utils.data import Dataset, DataLoader, TensorDataset, Sampler
 from typing import Dict, Any, Tuple, Optional, List
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.model_selection import train_test_split
 import logging
 from pathlib import Path
+from collections import Counter
+import random
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +36,144 @@ class MLPDataset(Dataset):
     
     def __getitem__(self, idx):
         return self.X[idx], self.y[idx]
+
+
+class BalancedBatchSampler(Sampler):
+    """Balanced batch sampler for handling class imbalance during training."""
+    
+    def __init__(self, labels: np.ndarray, batch_size: int, random_state: int = 42):
+        """
+        Initialize balanced batch sampler.
+        
+        Args:
+            labels: Array of labels
+            batch_size: Size of each batch
+            random_state: Random state for reproducibility
+        """
+        self.labels = labels
+        self.batch_size = batch_size
+        self.random_state = random_state
+        super().__init__(data_source=None)
+        
+        # Group indices by class
+        self.class_indices = {}
+        for idx, label in enumerate(labels):
+            if label not in self.class_indices:
+                self.class_indices[label] = []
+            self.class_indices[label].append(idx)
+        
+        self.classes = list(self.class_indices.keys())
+        self.n_classes = len(self.classes)
+        
+        # Set random seed
+        random.seed(random_state)
+        np.random.seed(random_state)
+    
+    def __iter__(self):
+        """Generate balanced batches."""
+        # Calculate samples per class per batch
+        samples_per_class = max(1, self.batch_size // self.n_classes)
+        
+        # Create copies of class indices for sampling
+        class_indices_copy = {cls: indices.copy() for cls, indices in self.class_indices.items()}
+        
+        # Shuffle indices for each class
+        for cls in class_indices_copy:
+            random.shuffle(class_indices_copy[cls])
+        
+        batch = []
+        class_pointers = {cls: 0 for cls in self.classes}
+        
+        while True:
+            # Check if we have enough samples left
+            total_remaining = sum(len(indices) - class_pointers[cls] 
+                                for cls, indices in class_indices_copy.items())
+            
+            if total_remaining < self.batch_size:
+                # Yield remaining batch if it's not empty
+                if batch:
+                    yield batch
+                break
+            
+            # Sample from each class
+            current_batch = []
+            for cls in self.classes:
+                indices = class_indices_copy[cls]
+                pointer = class_pointers[cls]
+                
+                # If we've exhausted this class, reshuffle and reset
+                if pointer >= len(indices):
+                    random.shuffle(indices)
+                    pointer = 0
+                    class_pointers[cls] = 0
+                
+                # Sample up to samples_per_class from this class
+                end_idx = min(pointer + samples_per_class, len(indices))
+                current_batch.extend(indices[pointer:end_idx])
+                class_pointers[cls] = end_idx
+            
+            # Add to batch
+            batch.extend(current_batch)
+            
+            # Yield batch when it reaches desired size
+            if len(batch) >= self.batch_size:
+                yield batch[:self.batch_size]
+                batch = batch[self.batch_size:]
+    
+    def __len__(self):
+        """Estimate number of batches."""
+        return len(self.labels) // self.batch_size
+
+
+class FocalLoss(nn.Module):
+    """
+    Focal Loss for addressing class imbalance.
+    Reference: https://arxiv.org/abs/1708.02002
+    """
+    
+    def __init__(self, alpha: Optional[torch.Tensor] = None, gamma: float = 2.0, 
+                 reduction: str = 'mean'):
+        """
+        Initialize Focal Loss.
+        
+        Args:
+            alpha: Weighting factor for classes (optional)
+            gamma: Focusing parameter
+            reduction: Reduction method ('mean', 'sum', 'none')
+        """
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+        self.cross_entropy = nn.CrossEntropyLoss(reduction='none')
+    
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """
+        Compute focal loss.
+        
+        Args:
+            inputs: Model predictions (logits)
+            targets: True labels
+            
+        Returns:
+            Focal loss value
+        """
+        ce_loss = self.cross_entropy(inputs, targets)
+        pt = torch.exp(-ce_loss)
+        focal_loss = (1 - pt) ** self.gamma * ce_loss
+        
+        if self.alpha is not None:
+            if self.alpha.device != targets.device:
+                self.alpha = self.alpha.to(targets.device)
+            alpha_t = self.alpha.gather(0, targets)
+            focal_loss = alpha_t * focal_loss
+        
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
 
 
 class MLPNetwork(nn.Module):
@@ -88,6 +228,29 @@ class MLPModel:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.is_trained = False
         self.training_history = {'train_loss': [], 'val_loss': [], 'val_accuracy': []}
+    
+    def _compute_focal_loss_alpha(self, y: np.ndarray) -> torch.Tensor:
+        """
+        Compute alpha weights for focal loss based on class frequencies.
+        
+        Args:
+            y: Training labels
+            
+        Returns:
+            Alpha tensor for focal loss
+        """
+        class_counts = Counter(y)
+        classes = sorted(class_counts.keys())
+        counts = np.array([class_counts[cls] for cls in classes])
+        
+        # Compute inverse frequency weights
+        total_samples = len(y)
+        alpha_weights = total_samples / (len(classes) * counts)
+        
+        # Normalize weights
+        alpha_weights = alpha_weights / alpha_weights.sum() * len(classes)
+        
+        return torch.FloatTensor(alpha_weights)
     
     def _create_model(self, input_size: int, num_classes: int):
         """
@@ -149,11 +312,27 @@ class MLPModel:
         self._create_model(input_size, num_classes)
         
         train_dataset = MLPDataset(X_train_scaled, y_train_encoded)
-        train_loader = DataLoader(
-            train_dataset, 
-            batch_size=self.model_config.get('batch_size', 32),
-            shuffle=True
-        )
+        
+        # Use balanced batch sampling if enabled
+        use_balanced_sampling = self.model_config.get('use_balanced_sampling', True)
+        batch_size = self.model_config.get('batch_size', 32)
+        
+        if use_balanced_sampling:
+            balanced_sampler = BalancedBatchSampler(
+                y_train_encoded, 
+                batch_size=batch_size,
+                random_state=self.model_config.get('random_state', 42)
+            )
+            train_loader = DataLoader(
+                train_dataset,
+                batch_sampler=balanced_sampler
+            )
+        else:
+            train_loader = DataLoader(
+                train_dataset, 
+                batch_size=batch_size,
+                shuffle=True
+            )
         
         val_loader = None
         if X_val is not None and y_val is not None:
@@ -165,7 +344,15 @@ class MLPModel:
                 shuffle=False
             )
         
-        criterion = nn.CrossEntropyLoss()
+        # Choose loss function
+        use_focal_loss = self.model_config.get('use_focal_loss', False)
+        if use_focal_loss:
+            alpha_weights = self._compute_focal_loss_alpha(y_train_encoded).to(self.device)
+            gamma = self.model_config.get('focal_loss_gamma', 2.0)
+            criterion = FocalLoss(alpha=alpha_weights, gamma=gamma)
+            logger.info(f"Using Focal Loss with gamma={gamma} and alpha weights")
+        else:
+            criterion = nn.CrossEntropyLoss()
         optimizer = optim.Adam(
             self.model.parameters(), 
             lr=self.model_config.get('learning_rate', 0.001)
